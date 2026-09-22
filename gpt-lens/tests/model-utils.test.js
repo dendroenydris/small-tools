@@ -42,7 +42,10 @@ assert(premiumPro.limit === 50 && premiumPro.hours === 168, "Business Premium Pr
 assert(findRule("businessPremium", "gpt-5-6-thinking").softUnlimited === true, "Business Premium thinking soft unlimited");
 
 const pro5 = findRule("prox5", "gpt-5-6-pro");
-assert(pro5.limit === 50 && pro5.hours === 168, "Pro 5x Pro 50/week");
+const astra5 = findRule("prox5", "gpt-6-astra-pro");
+assert(pro5 === astra5, "Pro 5x Astra and Sol Pro must share one quota rule");
+assert(pro5.limit === 50 && pro5.hours === 168 && pro5.sharedCap === true, "Pro 5x shared Pro cap 50/week");
+assert(pro5.models.includes("gpt-6-astra-pro") && pro5.models.includes("gpt-5-6-pro"), "Pro 5x shared rule must include Astra and 5.6 Pro");
 assert(findRule("prox5", "gpt-5-6-thinking").softUnlimited === true, "Pro 5x thinking soft unlimited");
 
 const astra20 = findRule("prox20", "gpt-6-astra-pro");

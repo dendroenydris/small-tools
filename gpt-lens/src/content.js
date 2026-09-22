@@ -7,6 +7,8 @@
   const STORAGE_KEYS = ["modelLensEvents", "modelLensSettings", "modelLensDetectedPlan", "modelLensSyncMeta"];
   const DEFAULT_SETTINGS = {
     panelMode: "peek",
+    panelYRatio: 0.42,
+    panelPositionVersion: 1,
     view: "monitor",
     quotaProfile: "free",
     autoUseDetectedPlan: true,
@@ -66,7 +68,20 @@
     });
     const storedSettings = data.modelLensSettings || {};
     const { collapsed: legacyCollapsed, ...settings } = storedSettings;
+    const migrateLegacyCenter =
+      storedSettings.panelPositionVersion == null &&
+      Number(storedSettings.panelYRatio) === 0.5;
     state.settings = { ...DEFAULT_SETTINGS, ...settings };
+    const panelYRatio = migrateLegacyCenter
+      ? DEFAULT_SETTINGS.panelYRatio
+      : Number(state.settings.panelYRatio);
+    state.settings.panelYRatio = Number.isFinite(panelYRatio)
+      ? Math.min(1, Math.max(0, panelYRatio))
+      : DEFAULT_SETTINGS.panelYRatio;
+    state.settings.panelPositionVersion = 1;
+    if (migrateLegacyCenter) {
+      chrome.storage.local.set({ modelLensSettings: state.settings }).catch(() => {});
+    }
     state.settings.quotaProfile = S.normalizePlanType(state.settings.quotaProfile) || "free";
     if (!PANEL_MODES.has(state.settings.panelMode)) {
       state.settings.panelMode = legacyCollapsed ? "dock" : "peek";
@@ -274,6 +289,106 @@
 
   const root = h("aside", { id: "model-lens-root", "aria-label": "GPT Lens" });
   document.documentElement.append(root);
+
+  const DRAG_MARGIN = 8;
+  const DRAG_THRESHOLD = 4;
+  let suppressedClickSource = null;
+  let suppressClickTimer = null;
+
+  function clampedPanelCenter(centerY) {
+    const viewportHeight = Math.max(1, window.innerHeight);
+    const panelHeight = Math.min(root.getBoundingClientRect().height || 0, viewportHeight);
+    const half = panelHeight / 2;
+    const min = Math.min(viewportHeight / 2, DRAG_MARGIN + half);
+    const max = Math.max(viewportHeight / 2, viewportHeight - DRAG_MARGIN - half);
+    return Math.min(max, Math.max(min, centerY));
+  }
+
+  function setPanelCenter(centerY) {
+    const center = clampedPanelCenter(centerY);
+    root.style.top = `${center}px`;
+    return center;
+  }
+
+  function applyPanelPosition() {
+    const ratio = Number.isFinite(Number(state.settings.panelYRatio))
+      ? Number(state.settings.panelYRatio)
+      : DEFAULT_SETTINGS.panelYRatio;
+    setPanelCenter(window.innerHeight * ratio);
+  }
+
+  function persistPanelCenter(centerY) {
+    const viewportHeight = Math.max(1, window.innerHeight);
+    const ratio = Math.min(1, Math.max(0, centerY / viewportHeight));
+    state.settings = {
+      ...state.settings,
+      panelYRatio: ratio,
+      updatedAt: new Date().toISOString()
+    };
+    chrome.storage.local.set({ modelLensSettings: state.settings }).catch(() => {});
+  }
+
+  function suppressNextClickFrom(source) {
+    suppressedClickSource = source;
+    if (suppressClickTimer) window.clearTimeout(suppressClickTimer);
+    suppressClickTimer = window.setTimeout(() => {
+      suppressedClickSource = null;
+      suppressClickTimer = null;
+    }, 350);
+  }
+
+  root.addEventListener("click", (event) => {
+    if (!suppressedClickSource || !suppressedClickSource.contains(event.target)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    suppressedClickSource = null;
+    if (suppressClickTimer) window.clearTimeout(suppressClickTimer);
+    suppressClickTimer = null;
+  }, true);
+
+  root.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || !event.isPrimary) return;
+    const source = event.target.closest(".ml-edge-handle, .ml-header");
+    if (!source || !root.contains(source)) return;
+    if (source.classList.contains("ml-header") &&
+        event.target.closest("button, input, select, textarea, a, [data-no-drag]")) return;
+
+    const rect = root.getBoundingClientRect();
+    const startCenter = rect.top + rect.height / 2;
+    const startPointerY = event.clientY;
+    let moved = false;
+    let lastCenter = startCenter;
+
+    try { source.setPointerCapture(event.pointerId); } catch {}
+    root.classList.add("is-dragging");
+
+    const move = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      const deltaY = moveEvent.clientY - startPointerY;
+      if (!moved && Math.abs(deltaY) >= DRAG_THRESHOLD) moved = true;
+      if (!moved) return;
+      moveEvent.preventDefault();
+      lastCenter = setPanelCenter(startCenter + deltaY);
+    };
+
+    const finish = (endEvent) => {
+      if (endEvent.pointerId !== event.pointerId) return;
+      source.removeEventListener("pointermove", move);
+      source.removeEventListener("pointerup", finish);
+      source.removeEventListener("pointercancel", finish);
+      try { source.releasePointerCapture(event.pointerId); } catch {}
+      root.classList.remove("is-dragging");
+      if (!moved) return;
+      suppressNextClickFrom(source);
+      persistPanelCenter(lastCenter);
+    };
+
+    source.addEventListener("pointermove", move);
+    source.addEventListener("pointerup", finish);
+    source.addEventListener("pointercancel", finish);
+  });
+
+  window.addEventListener("resize", () => requestAnimationFrame(applyPanelPosition));
 
   function statusInfo(status) {
     if (status === "normal") return { label: "Normal", cls: "normal", detail: "Request and backend model match" };
@@ -828,15 +943,18 @@
 
     if (mode === "dock") {
       root.append(renderEdgeHandle("dock"));
+      requestAnimationFrame(applyPanelPosition);
       return;
     }
 
     if (mode === "peek") {
       root.append(renderPeek());
+      requestAnimationFrame(applyPanelPosition);
       return;
     }
 
     root.append(renderFull());
+    requestAnimationFrame(applyPanelPosition);
   }
 
   chrome.storage.onChanged.addListener(async (changes, area) => {

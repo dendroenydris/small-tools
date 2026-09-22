@@ -31,6 +31,10 @@
   line-height: 1.35;
   color-scheme: light dark;
 }
+#model-lens-root.is-dragging {
+  user-select: none;
+  -webkit-user-select: none;
+}
 
 @media (prefers-color-scheme: dark) {
   #model-lens-root {
@@ -76,8 +80,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
+  cursor: grab;
+  touch-action: none;
 }
+#model-lens-root.is-dragging .ml-edge-handle { cursor: grabbing; }
 #model-lens-root .ml-edge-handle:hover { background: var(--ml-panel-strong); }
 #model-lens-root .ml-handle-chevron {
   color: var(--ml-amber);
@@ -118,6 +124,10 @@
   opacity: 1;
   visibility: visible;
   transform: translateY(-50%) translateX(0);
+}
+#model-lens-root.is-dragging .ml-edge-handle::after {
+  opacity: 0;
+  visibility: hidden;
 }
 
 #model-lens-root .ml-peek-wrap {
@@ -282,7 +292,14 @@
   padding: 0 8px 0 12px;
   justify-content: space-between;
   border-bottom: 1px solid var(--ml-border);
+  cursor: grab;
+  touch-action: none;
 }
+#model-lens-root.is-dragging .ml-header { cursor: grabbing; }
+#model-lens-root .ml-header button,
+#model-lens-root .ml-header input,
+#model-lens-root .ml-header select,
+#model-lens-root .ml-header a { cursor: pointer; }
 
 #model-lens-root .ml-brand { display: grid; gap: 0; letter-spacing: -0.01em; }
 #model-lens-root .ml-brand strong { font-size: 12.5px; font-weight: 650; }

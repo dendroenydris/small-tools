@@ -164,8 +164,12 @@
     prox5: {
       label: "Pro 5x",
       rules: [
-        unavailable("astraPro"),
-        numeric("solPro", 50, 168, "week"),
+        makeRule(
+          "prox5-pro-shared-week",
+          "GPT-6 Pro + GPT-5.6 / GPT-5.5 Pro — shared",
+          [...MODEL_GROUPS.astraPro, ...MODEL_GROUPS.solPro],
+          { limit: 50, hours: 168, period: "week", sharedCap: true }
+        ),
         softUnlimited("thinkingShared"),
         softUnlimited("instantShared")
       ]
