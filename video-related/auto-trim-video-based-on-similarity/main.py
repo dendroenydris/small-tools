@@ -1,3 +1,4 @@
+import sys
 import cv2
 import numpy as np
 import glob
@@ -5,7 +6,6 @@ from moviepy.editor import VideoFileClip
 import os
 from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim
-
 
 
 def ensure_directory_exists(directory):
@@ -45,7 +45,6 @@ def generate_clup_list_manual(
     total_frames = int(video_clip.fps * video_clip.duration)
     frame_indices = [i for i in range(0, total_frames, step)]
     clip_list = [0]
-    print(frame_indices)
 
     for idx in range(0, len(frame_indices) - step, step):
         frame1 = video_clip.get_frame(frame_indices[idx] / video_clip.fps)
@@ -54,7 +53,6 @@ def generate_clup_list_manual(
             frame_indices[idx] - clip_list[-1] > step * min_step
         ):
             clip_list.append(idx)
-            print(detect_similarity(frame1, frame2))
     clip_list.append(-1)
     return clip_list
 
@@ -98,7 +96,8 @@ def generate_clup_list_auto(
         ):
             print(frame_indices[idx] - clip_list[-1])
             idx, sim = argmin_frame_between(
-                frame_indices[idx], frame_indices[idx + 1], ini_step // 2, video_clip
+                frame_indices[idx], frame_indices[idx +
+                                                  1], ini_step // 2, video_clip
             )
             clip_list += [idx]
             print(sim_direct, idx)
@@ -118,7 +117,7 @@ def clip_video_file(
     min_step=3,
     sim_scale=128,
 ):
-    total_frames = int(video_clip.fps * video_clip.duration)
+    # total_frames = int(video_clip.fps * video_clip.duration)
     if option != "auto":
         clip_list = generate_clup_list_manual(
             video_clip, step, sim_threshold, min_step, sim_scale=sim_scale
@@ -135,7 +134,8 @@ def clip_video_file(
     if len(clip_list) == 2:
         return
 
-    progress_bar = tqdm(total=len(clip_list) - 1, desc="Processing clips", unit="clips")
+    progress_bar = tqdm(total=len(clip_list) - 1,
+                        desc="Processing clips", unit="clips")
     print(clip_list)
 
     for i in range(0, len(clip_list) - 1):
@@ -149,19 +149,67 @@ def clip_video_file(
         progress_bar.update(1)
 
 
+def process_video_clip(
+    output_dir, videofilename, sim_threshold=0.3, step=64, sim_scale=256, min_step=3
+):
+    video_clip = VideoFileClip(videofilename)
+    # video_clip = video_clip.subclip(0, 2000 / video_clip.fps)
+    video_name = os.path.basename(videofilename)
+    this_out_dir = output_dir + "/" + video_name.split(".")[0]
+    ensure_directory_exists(this_out_dir)
+    output_video_path = os.path.join(
+        this_out_dir, os.path.splitext(video_name)[0])
+    clip_video_file(
+        video_clip,
+        output_video_path,
+        sim_threshold=sim_threshold,
+        min_step=min_step,
+        step=step,
+        sim_scale=sim_scale,
+    )
+    print(f"Successfully processed {video_name}")
+
+
 if __name__ == "__main__":
     output_dir = "output"
     ensure_directory_exists(output_dir)
-    videos = [f for f in glob.glob("video/*") if is_valid_video_file(f)]
+    print(sys.argv)
+    sim = 0.3
+    step = 64
+    if "--sim" in sys.argv:
+        index = sys.argv.index("--sim")
+        # Check if there is a value after '--sim' in sys.argv
+        if index + 1 < len(sys.argv):
+            # Assign the next item as simvalue
+            try:
+                sim = float(sys.argv[index + 1])
+            except:
+                print("sim value error")
+    if "--step" in sys.argv:
+        index = sys.argv.index("--step")
+        # Check if there is a value after '--sim' in sys.argv
+        if index + 1 < len(sys.argv):
+            # Assign the next item as simvalue
+            try:
+                step = int(sys.argv[index + 1])
+            except:
+                print("step value error")
 
-    for video in videos:
-        video_clip = VideoFileClip(video)
-        # video_clip = video_clip.subclip(0, 2000 / video_clip.fps)
-        video_name = os.path.basename(video)
-        this_out_dir = output_dir + "/" + video_name.split(".")[0]
-        ensure_directory_exists(this_out_dir)
-        output_video_path = os.path.join(this_out_dir, os.path.splitext(video_name)[0])
-        clip_video_file(
-            video_clip, output_video_path, sim_threshold=0.2, step=32, sim_scale=256
-        )
-        print(f"Successfully processed {video_name}")
+    if "-i" in sys.argv:
+        index = sys.argv.index("-i")
+        if index + 1 < len(sys.argv):
+            # Assign the next item as simvalue
+            pre_entered_input = sys.argv[index + 1]
+            process_video_clip(
+                output_dir="./",
+                videofilename=pre_entered_input,
+                sim_threshold=sim, step=step
+            )
+        else:
+            print("no input file")
+    else:
+        videos = [f for f in glob.glob("video/*") if is_valid_video_file(f)]
+        for video in videos:
+            process_video_clip(
+                output_dir=output_dir, videofilename=video, sim_threshold=sim, step=step
+            )

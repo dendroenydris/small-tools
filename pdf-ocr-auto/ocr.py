@@ -1,5 +1,6 @@
 from ast import For
 from fileinput import filename
+import os
 import requests
 
 
@@ -62,9 +63,11 @@ def ocr_space_url(url, overlay=False, api_key='helloworld', language='eng'):
     return parse(r.json())
 
 
-files = ["音乐学+政治+心理.pdf", "考古+地理.pdf", "天文学astronomy.pdf",
-         "气象学及自然灾害＋农业.pdf", "动物学zoology.pdf", "生态学＋环境保护＋重要学科名称.pdf"]
-
+dir="input"
+files=os.listdir(dir)
+files=[os.path.join(dir, path) for path in files]
+# files = ["super-topic-1.pdf","super-topic-2.pdf","super-topic-3.pdf","super-topic-4.pdf"]
+print(files)
 for file in files:
     # Use examples:
     test_file = ocr_space_file(filename=file)

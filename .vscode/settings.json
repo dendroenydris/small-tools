@@ -1,5 +1,14 @@
 {
     "cSpell.words": [
         "qwertyuiopasdfghjklzxcvbnm"
-    ]
+    ],
+    "CodeGPT.apiKey": "CodeGPT Plus Beta",
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true
+    },
+    "hide-files.files": []
 }
