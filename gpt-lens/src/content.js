@@ -499,9 +499,11 @@
 
   async function adjustModelUsage(model, delta, hours) {
     const canonical = S.canonicalModel(model);
+    const amount = Math.trunc(Number(delta));
+    if (!canonical || !Number.isFinite(amount) || amount === 0) return amount === 0;
     const now = new Date();
 
-    if (delta > 0) {
+    if (amount > 0) {
       state.events.push({
         id: uid(),
         timestamp: now.toISOString(),
@@ -514,42 +516,50 @@
         thinkingEffort: null,
         status: "manual",
         manualAdjustment: true,
-        manualDelta: 1
+        manualDelta: amount
       });
     } else {
       const cutoff = now.getTime() - hours * 3600_000;
-      const neutralized = new Set(
-        state.events
-          .filter((event) => event.manualAdjustment && event.manualDelta === -1 && event.targetEventId)
-          .map((event) => event.targetEventId)
-      );
-      const target = [...state.events]
-        .filter((event) => {
-          const ts = new Date(event.timestamp || 0).getTime();
-          return Number.isFinite(ts) &&
-            ts >= cutoff &&
-            S.canonicalModel(event.frontendModel) === canonical &&
-            S.eventWeight(event) > 0 &&
-            !neutralized.has(event.id);
-        })
-        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
+      let remaining = -amount;
 
-      if (!target) return false;
-      state.events.push({
-        id: uid(),
-        timestamp: target.timestamp,
-        createdAt: now.toISOString(),
-        conversationId: target.conversationId || null,
-        frontendModel: canonical,
-        backendModel: null,
-        backendSource: "manual adjustment",
-        backendConfidence: null,
-        thinkingEffort: null,
-        status: "manual",
-        manualAdjustment: true,
-        manualDelta: -1,
-        targetEventId: target.id
-      });
+      while (remaining > 0) {
+        const neutralizedCounts = new Map();
+        for (const event of state.events) {
+          if (!event.manualAdjustment || event.manualDelta !== -1 || !event.targetEventId) continue;
+          neutralizedCounts.set(event.targetEventId, (neutralizedCounts.get(event.targetEventId) || 0) + 1);
+        }
+
+        const target = [...state.events]
+          .filter((event) => {
+            const ts = new Date(event.timestamp || 0).getTime();
+            const available = S.eventWeight(event) - (neutralizedCounts.get(event.id) || 0);
+            return Number.isFinite(ts) &&
+              ts >= cutoff &&
+              S.canonicalModel(event.frontendModel) === canonical &&
+              available > 0;
+          })
+          .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
+
+        if (!target) break;
+        state.events.push({
+          id: uid(),
+          timestamp: target.timestamp,
+          createdAt: now.toISOString(),
+          conversationId: target.conversationId || null,
+          frontendModel: canonical,
+          backendModel: null,
+          backendSource: "manual adjustment",
+          backendConfidence: null,
+          thinkingEffort: null,
+          status: "manual",
+          manualAdjustment: true,
+          manualDelta: -1,
+          targetEventId: target.id
+        });
+        remaining -= 1;
+      }
+
+      if (remaining === -amount) return false;
     }
 
     if (state.events.length > 10000) state.events = state.events.slice(-10000);
@@ -751,9 +761,41 @@
       manualList.replaceChildren();
       const rows = manualModelRows();
       for (const row of rows) {
-        const count = h("span", { class: "ml-adjust-count", text: String(row.count) });
+        const count = h("input", {
+          class: "ml-adjust-count",
+          type: "number",
+          min: "0",
+          step: "1",
+          inputmode: "numeric",
+          value: String(row.count),
+          "aria-label": `Set ${S.modelLabel(row.model)} usage count`
+        });
         const minus = h("button", { class: "ml-stepper-button", title: `Decrease ${S.modelLabel(row.model)}`, text: "−" });
         const plus = h("button", { class: "ml-stepper-button", title: `Increase ${S.modelLabel(row.model)}`, text: "+" });
+        let committing = false;
+
+        const commitCount = async () => {
+          if (committing) return;
+          const raw = count.value.trim();
+          const target = Number(raw);
+          if (!raw || !Number.isSafeInteger(target) || target < 0) {
+            count.value = String(row.count);
+            return;
+          }
+          const delta = target - row.count;
+          if (delta === 0) {
+            count.value = String(row.count);
+            return;
+          }
+          committing = true;
+          count.disabled = true;
+          minus.disabled = true;
+          plus.disabled = true;
+          const changed = await adjustModelUsage(row.model, delta, row.hours);
+          if (!changed) count.value = String(row.count);
+          renderManualList();
+        };
+
         minus.disabled = row.count <= 0;
         minus.addEventListener("click", async () => {
           minus.disabled = true;
@@ -765,6 +807,13 @@
           await adjustModelUsage(row.model, 1, row.hours);
           renderManualList();
         });
+        count.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          count.blur();
+        });
+        count.addEventListener("blur", () => { void commitCount(); });
+
         manualList.append(h("div", { class: "ml-manual-row" },
           h("div", { class: "ml-manual-model" },
             h("b", { text: S.modelLabel(row.model) }),
@@ -787,7 +836,7 @@
       ),
       h("section", { class: "ml-settings-section" },
         h("div", { class: "ml-field-title", text: "Manual usage correction" }),
-        h("div", { class: "ml-field-help", text: "Adjust local counts without changing captured requests." }),
+        h("div", { class: "ml-field-help", text: "Use −/+ or type a non-negative count. Captured requests stay unchanged." }),
         manualList
       ),
       h("section", { class: "ml-settings-section" },
@@ -881,17 +930,14 @@
       onClick: () => saveSettings({ panelMode: "full" })
     },
       h("div", { class: "ml-peek-top" },
-        h("strong", { class: "ml-peek-model", text: model, title: model })
+        h("strong", { class: "ml-peek-model", text: model, title: model }),
+        h("span", { class: `ml-peek-status ${status.cls}`, text: status.label })
       ),
       h("div", { class: "ml-peek-meta" },
         h("span", { class: `ml-peek-count ${quota?.kind || "unknown"}` },
           h("b", { text: usageText }),
           periodText ? h("span", { class: "ml-peek-period", text: ` (${periodText})` }) : null,
           quota?.uncertain ? h("span", { class: "ml-peek-uncertain", text: " ?" }) : null
-        ),
-        h("span", { class: `ml-peek-status ${status.cls}` },
-          h("i", { class: "ml-peek-status-dot" }),
-          h("span", { text: status.label })
         )
       ),
       numericQuota ? h("div", { class: "ml-peek-progress-row" },

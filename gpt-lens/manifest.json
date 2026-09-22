@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "GPT Lens for ChatGPT",
   "short_name": "GPT Lens",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Observe ChatGPT request models, compare them with server-exposed model metadata, track local usage, sync with Google Drive, and export selected turns to Markdown.",
   "minimum_chrome_version": "120",
   "permissions": [
