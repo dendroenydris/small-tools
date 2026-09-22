@@ -11,10 +11,11 @@ function assert(cond, msg) { if (!cond) throw new Error(msg); }
 const now = Date.now();
 const ts = new Date(now - 10_000).toISOString();
 const events = [
-  { id: "real-1", frontendModel: "gpt-6-pro", timestamp: ts },
-  { id: "manual-plus", frontendModel: "gpt-6-pro", timestamp: new Date(now - 5_000).toISOString(), manualAdjustment: true, manualDelta: 1 },
-  { id: "manual-minus", frontendModel: "gpt-6-pro", timestamp: ts, manualAdjustment: true, manualDelta: -1, targetEventId: "real-1" }
+  { id: "real-1", frontendModel: "gpt-6-astra-pro", timestamp: ts },
+  { id: "manual-plus", frontendModel: "gpt-6-astra-pro", timestamp: new Date(now - 5_000).toISOString(), manualAdjustment: true, manualDelta: 1 },
+  { id: "manual-minus", frontendModel: "gpt-6-astra-pro", timestamp: ts, manualAdjustment: true, manualDelta: -1, targetEventId: "real-1" }
 ];
-assert(S.countModel(events, "gpt-6-pro", 168, now) === 1, "signed manual adjustments should affect model count");
-assert(S.countRule(events, S.PLAN_PROFILES.prox5.rules[0], now) === 1, "signed manual adjustments should affect quota rules");
+const astraRule = S.PLAN_PROFILES.prox20.rules.find((rule) => rule.models.includes("gpt-6-astra-pro") && !rule.sharedCap);
+assert(S.countModel(events, "gpt-6-astra-pro", 168, now) === 1, "signed manual adjustments should affect model count");
+assert(S.countRule(events, astraRule, now) === 1, "signed manual adjustments should affect quota rules");
 console.log("manual adjustment tests passed");

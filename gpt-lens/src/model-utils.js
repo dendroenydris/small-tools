@@ -1,119 +1,207 @@
 (() => {
-  const MODEL_LABELS = {
-    "gpt-6-pro": "GPT-6 Pro",
-    "gpt-5.6-sol-pro": "GPT-5.6 Sol Pro",
-    "gpt-5.6-sol": "GPT-5.6 Sol",
-    "gpt-5.6-luna": "GPT-5.6 Luna",
-    "gpt-5.6": "GPT-5.6",
-    "gpt-4o": "GPT-4o",
-    "o3": "o3",
-    "o3-pro": "o3 Pro",
-    "o4-mini": "o4-mini",
-    "o4-mini-high": "o4-mini-high",
-    "deep-research": "Deep Research"
-  };
-
   function normalizeSlug(slug) {
-    return String(slug || "").trim().toLowerCase().replace(/_/g, "-");
+    return String(slug || "")
+      .trim()
+      .toLowerCase()
+      .replace(/_/g, "-")
+      .replace(/^gpt-5\.([356])/, "gpt-5-$1");
   }
 
   function canonicalModel(slug) {
     const s = normalizeSlug(slug);
     if (!s) return "";
 
-    if (/^gpt-6(?:-thinking)?-pro$/.test(s) || s === "gpt-6-pro") return "gpt-6-pro";
-    if (/^gpt-5[-.]?6(?:-thinking)?-pro$/.test(s) || s === "gpt-5-6-pro") return "gpt-5.6-sol-pro";
-    if (/^gpt-5[-.]?6-(thinking|sol)$/.test(s) || s === "gpt-5-6-thinking") return "gpt-5.6-sol";
-    if (/^gpt-5[-.]?6-(instant|luna)$/.test(s) || s === "gpt-5-6-instant") return "gpt-5.6-luna";
-    if (s === "gpt-5-6" || s === "gpt-5.6") return "gpt-5.6";
-
-    if (/^gpt-4o/.test(s)) return "gpt-4o";
-    if (s === "o3") return "o3";
-    if (s === "o3-pro") return "o3-pro";
-    if (s === "o4-mini") return "o4-mini";
-    if (s === "o4-mini-high") return "o4-mini-high";
-    if (s.includes("deep-research")) return "deep-research";
-    return s;
+    const aliases = {
+      "gpt-6-pro": "gpt-6-astra-pro",
+      "gpt-6-astra": "gpt-6-astra-pro",
+      "gpt-5-6-luna": "gpt-5-6-instant",
+      "gpt-5-6-sol": "gpt-5-6-thinking",
+      "gpt-5-6-sol-pro": "gpt-5-6-pro",
+      "gpt-5-6-thinking-pro": "gpt-5-6-pro",
+      "gpt-5-5-thinking-pro": "gpt-5-5-pro",
+      "gpt-5-5-sol-pro": "gpt-5-5-pro"
+    };
+    return aliases[s] || s;
   }
 
   function modelLabel(slug) {
     const c = canonicalModel(slug);
-    return MODEL_LABELS[c] || slug || "—";
+    if (!c) return "—";
+    if (c === "gpt-6-astra-pro") return "gpt-6-astra-pro";
+    if (c === "gpt-5-6-pro") return "gpt-5.6-sol-pro";
+    if (c === "deep-research") return "Deep Research";
+    if (c === "gpt-4o") return "GPT-4o";
+    return c;
+  }
+
+  const MODEL_GROUPS = {
+    astraPro: ["gpt-6-astra-pro"],
+    solPro: ["gpt-5-6-pro", "gpt-5-5-pro"],
+    thinkingShared: [
+      "gpt-5-6",
+      "gpt-5-6-auto",
+      "gpt-5-6-thinking",
+      "gpt-5-5-thinking"
+    ],
+    instantShared: [
+      "gpt-5-5",
+      "gpt-5-5-instant",
+      "gpt-5-3",
+      "gpt-5-3-instant"
+    ]
+  };
+
+  const GROUP_LABELS = {
+    astraPro: "GPT-6 Astra Pro",
+    solPro: "GPT-5.6 Sol / GPT-5.5 Pro",
+    thinkingShared: "GPT-5.6 Sol / GPT-5.5 Thinking — shared",
+    instantShared: "GPT-5.5 / GPT-5.3 Instant — shared"
+  };
+
+  function makeRule(id, label, models, options = {}) {
+    return {
+      id,
+      label,
+      models: models.map(canonicalModel),
+      limit: typeof options.limit === "number" ? options.limit : null,
+      hours: typeof options.hours === "number" ? options.hours : null,
+      period: options.period || "",
+      unknown: !!options.unknown,
+      unavailable: !!options.unavailable,
+      softUnlimited: !!options.softUnlimited,
+      uncertain: !!options.uncertain,
+      sharedCap: !!options.sharedCap
+    };
+  }
+
+  function groupRule(group, options = {}) {
+    return makeRule(
+      options.id || group,
+      options.label || GROUP_LABELS[group],
+      MODEL_GROUPS[group],
+      options
+    );
+  }
+
+  function unavailable(group) {
+    return groupRule(group, { unavailable: true });
+  }
+
+  function unknown(group) {
+    return groupRule(group, { unknown: true });
+  }
+
+  function softUnlimited(group) {
+    return groupRule(group, { softUnlimited: true });
+  }
+
+  function numeric(group, limit, hours, period, extra = {}) {
+    return groupRule(group, { limit, hours, period, ...extra });
   }
 
   const PLAN_PROFILES = {
+    default: {
+      label: "Unknown plan",
+      hidden: true,
+      rules: [
+        unknown("astraPro"),
+        unknown("solPro"),
+        unknown("thinkingShared"),
+        unknown("instantShared")
+      ]
+    },
+
     free: {
       label: "Free",
       rules: [
-        { id: "free-56", label: "GPT-5.6", models: ["gpt-5.6", "gpt-5.6-luna"], limit: 10, hours: 5 },
-        { id: "free-56-thinking", label: "GPT-5.6 Thinking", models: ["gpt-5.6-sol"], limit: 1, hours: 24 }
+        unavailable("astraPro"),
+        unavailable("solPro"),
+        unknown("thinkingShared"),
+        unknown("instantShared")
       ]
     },
+
     go: {
       label: "Go",
       rules: [
-        { id: "go-instant", label: "GPT-5.6 Luna", models: ["gpt-5.6-luna"], limit: 160, hours: 3 },
-        { id: "go-thinking", label: "GPT-5.6 Sol", models: ["gpt-5.6-sol"], limit: 10, hours: 168 }
+        unavailable("astraPro"),
+        unavailable("solPro"),
+        unknown("thinkingShared"),
+        unknown("instantShared")
       ]
     },
+
     plus: {
       label: "Plus",
       rules: [
-        { id: "plus-4o", label: "GPT-4o", models: ["gpt-4o"], limit: 80, hours: 3 },
-        { id: "plus-instant", label: "GPT-5.6 Luna", models: ["gpt-5.6-luna"], limit: 160, hours: 3 },
-        { id: "plus-thinking", label: "GPT-5.6 Sol", models: ["gpt-5.6-sol"], limit: 3000, hours: 168 },
-        { id: "plus-o3", label: "o3", models: ["o3"], limit: 100, hours: 168 },
-        { id: "plus-o3-pro", label: "o3 Pro", models: ["o3-pro"], limit: 50, hours: 168 },
-        { id: "plus-deep", label: "Deep Research", models: ["deep-research"], limit: 25, hours: 720 }
+        unavailable("astraPro"),
+        unavailable("solPro"),
+        numeric("thinkingShared", 3000, 168, "week", { uncertain: true }),
+        softUnlimited("instantShared")
       ]
     },
-    team: {
-      label: "Team",
+
+    business: {
+      label: "Business",
       rules: [
-        { id: "team-thinking", label: "GPT-5.6 Sol", models: ["gpt-5.6-sol"], limit: 3000, hours: 168 },
-        { id: "team-pro", label: "GPT-5.6 Sol Pro", models: ["gpt-5.6-sol-pro"], limit: 15, hours: 720 },
-        { id: "team-o3", label: "o3", models: ["o3"], limit: 100, hours: 168 },
-        { id: "team-o3-pro", label: "o3 Pro", models: ["o3-pro"], limit: 50, hours: 168 },
-        { id: "team-deep", label: "Deep Research", models: ["deep-research"], limit: 25, hours: 720 }
+        unavailable("astraPro"),
+        numeric("solPro", 15, 720, "month"),
+        numeric("thinkingShared", 3000, 168, "week"),
+        softUnlimited("instantShared")
       ]
     },
-    pro: {
-      label: "Pro",
+
+    businessPremium: {
+      label: "Business Premium",
       rules: [
-        { id: "pro-o3", label: "o3", models: ["o3"], limit: 500, hours: 168 },
-        { id: "pro-o3-pro", label: "o3 Pro", models: ["o3-pro"], limit: 100, hours: 24 },
-        { id: "pro-deep", label: "Deep Research", models: ["deep-research"], limit: 120, hours: 720 }
+        unavailable("astraPro"),
+        numeric("solPro", 50, 168, "week"),
+        softUnlimited("thinkingShared"),
+        softUnlimited("instantShared")
       ]
     },
+
     prox5: {
-      label: "Pro ×5",
+      label: "Pro 5x",
       rules: [
-        {
-          id: "prox5-pro-combined-week",
-          label: "GPT-6 Pro + GPT-5.6 Sol Pro",
-          models: ["gpt-6-pro", "gpt-5.6-sol-pro"],
-          limit: 50,
-          hours: 168,
-          note: "combined / week"
-        }
+        unavailable("astraPro"),
+        numeric("solPro", 50, 168, "week"),
+        softUnlimited("thinkingShared"),
+        softUnlimited("instantShared")
       ]
     },
+
     prox20: {
-      label: "Pro ×20",
+      label: "Pro 20x",
       rules: [
-        { id: "prox20-6pro-week", label: "GPT-6 Pro", models: ["gpt-6-pro"], limit: 200, hours: 168, note: "week" },
-        { id: "prox20-56pro-day", label: "GPT-5.6 Sol Pro", models: ["gpt-5.6-sol-pro"], limit: 170, hours: 24, note: "day" },
-        {
-          id: "prox20-pro-combined-day",
-          label: "GPT-6 Pro + GPT-5.6 Sol Pro",
-          models: ["gpt-6-pro", "gpt-5.6-sol-pro"],
-          limit: 200,
-          hours: 24,
-          note: "combined / day"
-        }
+        numeric("astraPro", 200, 168, "week"),
+        numeric("solPro", 170, 24, "day", { uncertain: true }),
+        makeRule(
+          "prox20-pro-shared-day",
+          "Additional shared Pro cap",
+          [...MODEL_GROUPS.astraPro, ...MODEL_GROUPS.solPro],
+          { limit: 200, hours: 24, period: "day", sharedCap: true }
+        ),
+        softUnlimited("thinkingShared"),
+        softUnlimited("instantShared")
       ]
     }
   };
+
+  function normalizePlanType(plan) {
+    const p = String(plan || "").trim().toLowerCase().replace(/_/g, "-");
+    if (!p) return "";
+    if (PLAN_PROFILES[p]) return p;
+    if (p.includes("free")) return "free";
+    if (p === "go" || p.includes("chatgpt-go")) return "go";
+    if (p.includes("plus")) return "plus";
+    if (p.includes("business-premium") || p.includes("businesspremium")) return "businessPremium";
+    if (p.includes("business") || p.includes("team")) return "business";
+    if (p.includes("20x") || p.includes("x20") || p.includes("prox20")) return "prox20";
+    if (p.includes("5x") || p.includes("x5") || p.includes("prox5")) return "prox5";
+    if (p === "pro" || p.includes("chatgpt-pro")) return "businessPremium";
+    return "default";
+  }
 
   function eventWeight(event) {
     if (typeof event?.manualDelta === "number") return event.manualDelta;
@@ -121,8 +209,9 @@
   }
 
   function countRule(events, rule, now = Date.now()) {
+    if (!rule || !rule.hours) return 0;
     const cutoff = now - rule.hours * 3600_000;
-    const modelSet = new Set(rule.models);
+    const modelSet = new Set(rule.models.map(canonicalModel));
     const total = (events || []).reduce((sum, event) => {
       const ts = new Date(event.timestamp || 0).getTime();
       const model = canonicalModel(event.frontendModel);
@@ -148,15 +237,43 @@
     return canonicalModel(frontend) === canonicalModel(backend) ? "normal" : "mismatch";
   }
 
+  function ruleKind(rule) {
+    if (!rule) return "unknown";
+    if (rule.unavailable) return "unavailable";
+    if (rule.unknown) return "unknown";
+    if (rule.softUnlimited) return "soft-unlimited";
+    if (typeof rule.limit === "number") return "numeric";
+    return "unknown";
+  }
+
+  function ruleLimitText(rule) {
+    const kind = ruleKind(rule);
+    if (kind === "unavailable") return "Unavailable";
+    if (kind === "unknown") return "Unknown";
+    if (kind === "soft-unlimited") return "Soft unlimited";
+    if (kind === "numeric") return `${rule.limit}${rule.uncertain ? " ?" : ""}`;
+    return "Unknown";
+  }
+
+  function ruleRatio(count, rule) {
+    if (ruleKind(rule) !== "numeric" || !rule.limit || rule.limit <= 0) return 0;
+    return Math.min(1, count / rule.limit);
+  }
+
   globalThis.ModelLensShared = {
-    MODEL_LABELS,
+    MODEL_GROUPS,
+    GROUP_LABELS,
     PLAN_PROFILES,
     normalizeSlug,
     canonicalModel,
     modelLabel,
+    normalizePlanType,
     eventWeight,
     countRule,
     countModel,
-    compareModels
+    compareModels,
+    ruleKind,
+    ruleLimitText,
+    ruleRatio
   };
 })();

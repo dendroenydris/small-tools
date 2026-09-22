@@ -6,14 +6,15 @@
   const S = globalThis.ModelLensShared;
   const STORAGE_KEYS = ["modelLensEvents", "modelLensSettings", "modelLensDetectedPlan", "modelLensSyncMeta"];
   const DEFAULT_SETTINGS = {
-    collapsed: false,
+    panelMode: "peek",
     view: "monitor",
-    quotaProfile: "plus",
+    quotaProfile: "free",
     autoUseDetectedPlan: true,
     updatedAt: new Date().toISOString()
   };
+  const PANEL_MODES = new Set(["dock", "peek", "full"]);
 
-  let settingsModalOpen = false;
+  let settingsViewOpen = false;
 
   let state = {
     events: [],
@@ -32,12 +33,50 @@
     return location.pathname.match(/\/c\/([0-9a-z-]+)/i)?.[1] || null;
   }
 
+  function hasTrustedBackendEvidence(event) {
+    if (!event?.backendModel) return true;
+    const source = String(event.backendSource || "").split(" · ").pop();
+    if (event.backendEvidenceVersion === 3) {
+      const parts = source.split(" + ").map((part) => part.trim()).filter(Boolean);
+      return parts.length > 0 && parts.every((part) =>
+        /^(?:resolved_model_slug|server_ste_metadata\.model_slug|assistant\.metadata\.model_slug)$/.test(part)
+      );
+    }
+    if (event.backendEvidenceVersion === 2) {
+      return /^(?:assistant\.metadata|response(?:\.metadata)?)\.(?:backend_model|backend_model_slug|served_model|model_slug|model)$/.test(source);
+    }
+    return false;
+  }
+
   async function loadState() {
     const data = await chrome.storage.local.get(STORAGE_KEYS);
-    state.events = Array.isArray(data.modelLensEvents) ? data.modelLensEvents : [];
-    state.settings = { ...DEFAULT_SETTINGS, ...(data.modelLensSettings || {}) };
-    state.detectedPlan = data.modelLensDetectedPlan || null;
+    const storedEvents = Array.isArray(data.modelLensEvents) ? data.modelLensEvents : [];
+    let sanitized = false;
+    state.events = storedEvents.map((event) => {
+      if (hasTrustedBackendEvidence(event)) return event;
+      sanitized = true;
+      return {
+        ...event,
+        backendModel: null,
+        backendSource: null,
+        backendConfidence: null,
+        backendObservedAt: null,
+        status: "unverified"
+      };
+    });
+    const storedSettings = data.modelLensSettings || {};
+    const { collapsed: legacyCollapsed, ...settings } = storedSettings;
+    state.settings = { ...DEFAULT_SETTINGS, ...settings };
+    state.settings.quotaProfile = S.normalizePlanType(state.settings.quotaProfile) || "free";
+    if (!PANEL_MODES.has(state.settings.panelMode)) {
+      state.settings.panelMode = legacyCollapsed ? "dock" : "peek";
+    }
+    state.detectedPlan = S.normalizePlanType(data.modelLensDetectedPlan) || null;
+    if (state.settings.autoUseDetectedPlan && state.detectedPlan && S.PLAN_PROFILES[state.detectedPlan]) {
+      state.settings.quotaProfile = state.detectedPlan;
+    }
     state.syncMeta = data.modelLensSyncMeta || {};
+    if (sanitized) chrome.storage.local.set({ modelLensEvents: state.events }).catch(() => {});
   }
 
   async function saveEvents() {
@@ -47,7 +86,7 @@
   async function saveSettings(patch) {
     state.settings = { ...state.settings, ...patch, updatedAt: new Date().toISOString() };
     await chrome.storage.local.set({ modelLensSettings: state.settings });
-    if (!settingsModalOpen) render();
+    if (!settingsViewOpen) render();
   }
 
   function mostRecentEvent() {
@@ -59,6 +98,10 @@
   }
 
   function findEventForBackend(payload) {
+    if (payload.requestId) {
+      const exact = state.events.find((event) => event.requestId === payload.requestId);
+      if (exact) return exact;
+    }
     const now = Date.now();
     return [...state.events]
       .filter((e) => {
@@ -71,12 +114,16 @@
   }
 
   async function recordFrontend(payload) {
+    if (!payload.frontendModel) return;
+    if (payload.requestId && state.events.some((event) => event.requestId === payload.requestId)) return;
     const event = {
       id: uid(),
+      requestId: payload.requestId || null,
       timestamp: payload.timestamp || new Date().toISOString(),
       conversationId: payload.conversationId || currentConversationId(),
       parentMessageId: payload.parentMessageId || null,
       frontendModel: payload.frontendModel,
+      captureSource: payload.captureSource || null,
       backendModel: null,
       backendSource: null,
       backendConfidence: null,
@@ -90,12 +137,15 @@
   }
 
   async function recordBackend(payload) {
-    if (!payload.backendModel) return;
+    if (!payload.backendModel || payload.confidence !== "strong") return;
+    if (!/^(?:assistant\.metadata|response(?:\.metadata)?)\.(?:backend_model|backend_model_slug|served_model|model_slug|model)$/.test(String(payload.sourceField || ""))) return;
     const event = findEventForBackend(payload);
     if (!event) return;
+    if (event.backendModel || event.backendObservedAt) return;
     event.backendModel = payload.backendModel;
     event.backendSource = `${payload.source || "server"}${payload.sourceField ? ` · ${payload.sourceField}` : ""}`;
     event.backendConfidence = payload.confidence || "strong";
+    event.backendEvidenceVersion = 2;
     if (!event.conversationId && payload.conversationId) event.conversationId = payload.conversationId;
     event.status = event.backendConfidence === "strong"
       ? S.compareModels(event.frontendModel, event.backendModel)
@@ -105,12 +155,82 @@
     render();
   }
 
+  function routeStatus(verdict) {
+    if (verdict === "normal") return "normal";
+    if (verdict === "mismatch") return "mismatch";
+    if (verdict === "conflict") return "conflict";
+    if (verdict === "auto_reasoning") return "auto_reasoning";
+    return "unverified";
+  }
+
+  async function recordRouteObservation(payload) {
+    const captureId = payload?.captureId;
+    if (!captureId) return;
+
+    let event = state.events.find((candidate) => candidate.captureId === captureId);
+    if (!event) {
+      if (!payload.requestedModel) return;
+      event = {
+        id: uid(),
+        captureId,
+        requestId: payload.requestId || null,
+        timestamp: payload.startedAt || payload.observedAt || new Date().toISOString(),
+        conversationId: payload.conversationId || currentConversationId(),
+        parentMessageId: null,
+        frontendModel: payload.requestedModel,
+        captureSource: "conversation.payload.model",
+        backendModel: null,
+        backendSource: null,
+        backendConfidence: null,
+        backendEvidenceVersion: null,
+        thinkingEffort: payload.thinkingEffort || null,
+        status: "unverified",
+        routePhase: payload.phase || "requested"
+      };
+      state.events.push(event);
+      if (state.events.length > 10000) state.events = state.events.slice(-10000);
+    }
+
+    if (payload.requestedModel) event.frontendModel = payload.requestedModel;
+    if (payload.requestId) event.requestId = payload.requestId;
+    if (payload.conversationId) event.conversationId = payload.conversationId;
+    if (payload.thinkingEffort) event.thinkingEffort = payload.thinkingEffort;
+    event.routePhase = payload.phase || event.routePhase;
+
+    const status = routeStatus(payload.verdict);
+    const sourceField = Array.isArray(payload.routeSources) && payload.routeSources.length
+      ? payload.routeSources.join(" + ")
+      : payload.backendSource || null;
+
+    if (payload.backendModel) {
+      event.backendModel = payload.backendModel;
+      event.backendSource = `${payload.source || "route"}${sourceField ? ` · ${sourceField}` : ""}`;
+      event.backendConfidence = payload.backendExplicit ? "explicit-route" : "model-label";
+      event.backendEvidenceVersion = 3;
+      event.backendObservedAt = payload.observedAt || new Date().toISOString();
+      event.status = status;
+    } else if (status === "conflict") {
+      event.backendModel = null;
+      event.backendSource = `${payload.source || "route"}${sourceField ? ` · ${sourceField}` : ""}`;
+      event.backendConfidence = "conflicting-route-evidence";
+      event.backendEvidenceVersion = 3;
+      event.backendObservedAt = payload.observedAt || new Date().toISOString();
+      event.status = "conflict";
+    } else if (payload.phase === "requested") {
+      event.status = "unverified";
+    }
+
+    await saveEvents();
+    render();
+  }
+
   async function recordDetectedPlan(plan) {
-    if (!plan) return;
-    state.detectedPlan = plan;
-    await chrome.storage.local.set({ modelLensDetectedPlan: plan });
-    if (state.settings.autoUseDetectedPlan && S.PLAN_PROFILES[plan]) {
-      await saveSettings({ quotaProfile: plan });
+    const normalized = S.normalizePlanType(plan);
+    if (!normalized) return;
+    state.detectedPlan = normalized;
+    await chrome.storage.local.set({ modelLensDetectedPlan: normalized });
+    if (state.settings.autoUseDetectedPlan && S.PLAN_PROFILES[normalized]) {
+      await saveSettings({ quotaProfile: normalized });
     } else {
       render();
     }
@@ -119,14 +239,20 @@
   window.addEventListener("message", (event) => {
     if (event.source !== window || event.data?.channel !== CHANNEL) return;
     const { kind, payload } = event.data;
+    if (kind === "route-observation") recordRouteObservation(payload || {});
+    if (kind === "frontend-model") recordFrontend(payload || {});
+    if (kind === "plan-observed") recordDetectedPlan(payload?.plan);
     if (kind === "backend-model") recordBackend(payload);
   });
+  window.postMessage({ channel: CHANNEL, kind: "request-snapshot" }, "*");
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.channel !== "MODEL_LENS_EXTENSION") return;
     if (message.kind === "frontend-model") recordFrontend(message.payload || {});
     if (message.kind === "plan-observed") recordDetectedPlan(message.payload?.plan);
-    if (message.kind === "toggle-panel") saveSettings({ collapsed: !state.settings.collapsed });
+    if (message.kind === "toggle-panel") {
+      saveSettings({ panelMode: state.settings.panelMode === "dock" ? "peek" : "dock" });
+    }
   });
 
   function h(tag, attrs = {}, ...children) {
@@ -150,30 +276,79 @@
   document.documentElement.append(root);
 
   function statusInfo(status) {
-    if (status === "normal") return { label: "正常", cls: "normal", detail: "请求与服务器标识一致" };
-    if (status === "mismatch") return { label: "异常", cls: "mismatch", detail: "请求与服务器标识不一致" };
-    return { label: "未验证", cls: "unverified", detail: "没有强后端模型标识可比较" };
+    if (status === "normal") return { label: "Normal", cls: "normal", detail: "Request and backend model match" };
+    if (status === "mismatch") return { label: "Mismatch", cls: "mismatch", detail: "Request and backend model differ" };
+    if (status === "conflict") return { label: "Conflict", cls: "mismatch", detail: "Backend route evidence conflicts" };
+    if (status === "auto_reasoning") return { label: "Auto", cls: "unverified", detail: "Backend used an automatic reasoning route" };
+    return { label: "Unverified", cls: "unverified", detail: "No reliable backend model observed" };
+  }
+
+  function formatPeriod(_period, hours) {
+    if (hours === 168) return "week";
+    if (hours === 720) return "month";
+    if (hours === 24) return "day";
+    return hours ? `${hours}h` : "";
+  }
+
+  function formatCompactPeriod(hours) {
+    if (hours === 168) return "wk";
+    if (hours === 720) return "mo";
+    if (hours === 24) return "day";
+    return hours ? `${hours}h` : "";
   }
 
   function quotaProfile() {
-    return S.PLAN_PROFILES[state.settings.quotaProfile] || S.PLAN_PROFILES.plus;
+    const key = state.settings.autoUseDetectedPlan && state.detectedPlan
+      ? state.detectedPlan
+      : state.settings.quotaProfile;
+    return S.PLAN_PROFILES[key] || S.PLAN_PROFILES.free;
   }
 
   function renderQuotaRules() {
     const profile = quotaProfile();
     return profile.rules.map((rule) => {
+      const kind = S.ruleKind(rule);
       const count = S.countRule(state.events, rule);
-      const ratio = Math.min(1, count / rule.limit);
-      const period = rule.note || (rule.hours === 24 ? "day" : rule.hours === 168 ? "week" : rule.hours === 3 ? "3h" : `${rule.hours}h`);
+      const ratio = S.ruleRatio(count, rule);
+      const period = kind === "numeric" ? formatPeriod(rule.period, rule.hours) : "";
+      const valueText = kind === "numeric"
+        ? `${count} / ${S.ruleLimitText(rule)}`
+        : S.ruleLimitText(rule);
       return h("div", { class: "ml-quota" },
         h("div", { class: "ml-quota-top" },
           h("span", { class: "ml-quota-name", text: rule.label }),
-          h("span", { class: "ml-quota-count", text: `${count} / ${rule.limit}` })
+          h("span", { class: `ml-quota-count ${kind}`, text: valueText })
         ),
-        h("div", { class: "ml-progress" }, h("i", { style: `--ml-progress:${ratio * 100}%` })),
-        h("div", { class: "ml-quota-period", text: period })
+        kind === "numeric" ? h("div", { class: "ml-progress" }, h("i", { style: `--ml-progress:${ratio * 100}%` })) : null,
+        period ? h("div", {
+          class: "ml-quota-period",
+          text: `${period}${rule.sharedCap ? " · shared cap" : ""}`
+        }) : null
       );
     });
+  }
+
+  function compactQuota(latest) {
+    const profile = quotaProfile();
+    const canonical = S.canonicalModel(latest?.frontendModel);
+    const rule = profile.rules.find((candidate) =>
+      candidate.models.some((model) => S.canonicalModel(model) === canonical)
+    );
+    if (!rule) return null;
+    const kind = S.ruleKind(rule);
+    const count = S.countRule(state.events, rule);
+    return {
+      count,
+      ratio: S.ruleRatio(count, rule),
+      period: kind === "numeric" ? formatPeriod(rule.period, rule.hours) : "",
+      hours: rule.hours,
+      limitText: S.ruleLimitText(rule),
+      kind,
+      uncertain: !!rule.uncertain,
+      sharedCap: !!rule.sharedCap,
+      label: rule.label,
+      profile: profile.label
+    };
   }
 
   function manualModelRows() {
@@ -181,6 +356,7 @@
     const windows = new Map();
 
     for (const rule of profile.rules) {
+      if (!rule.hours) continue;
       for (const model of rule.models) {
         const canonical = S.canonicalModel(model);
         windows.set(canonical, Math.max(windows.get(canonical) || 0, rule.hours || 24));
@@ -278,10 +454,10 @@
           h("span", { class: "ml-status-detail", text: status.detail })
         ),
         h("div", { class: "ml-model-grid" },
-          h("span", { text: "前端请求" }),
-          h("b", { text: latest ? S.modelLabel(latest.frontendModel) : "—" }),
-          h("span", { text: "后端可观测" }),
-          h("b", { text: latest?.backendModel ? S.modelLabel(latest.backendModel) : "—" }),
+          h("span", { text: "Request model" }),
+          h("b", { text: latest?.frontendModel || "—" }),
+          h("span", { text: "Backend model" }),
+          h("b", { text: latest?.backendModel || "—" }),
           h("span", { text: "Thinking" }),
           h("b", { text: latest?.thinkingEffort || "—" })
         ),
@@ -292,7 +468,7 @@
           h("div", { class: "ml-eyebrow", text: "USAGE" }),
           h("div", { class: "ml-section-title", text: profile.label })
         ),
-        h("button", { class: "ml-link-button", text: "设置", onClick: () => openSettings() })
+        h("button", { class: "ml-link-button", text: "Settings", onClick: () => openSettings() })
       ),
       h("div", { class: "ml-quota-list" }, ...renderQuotaRules()),
       h("div", { class: "ml-meta-line", text: `Detected plan: ${detected} · ${state.events.length} local events` })
@@ -398,12 +574,12 @@
 
     return h("div", { class: "ml-view ml-export" },
       h("div", { class: "ml-export-head" },
-        h("div", {}, h("div", { class: "ml-eyebrow", text: "SELECT · EXPORT" }), h("div", { class: "ml-section-title", text: "当前对话" })),
+        h("div", {}, h("div", { class: "ml-eyebrow", text: "SELECT · EXPORT" }), h("div", { class: "ml-section-title", text: "Current conversation" })),
         h("button", { class: "ml-icon-button", title: "Refresh", text: "↻", onClick: () => { refreshExportTurns(true); render(); } })
       ),
       h("div", { class: "ml-export-tools" },
-        h("button", { class: "ml-chip", text: "全选", onClick: () => { state.selectedTurnIds = new Set(state.exportTurns.map((t) => t.id)); render(); } }),
-        h("button", { class: "ml-chip", text: "清空", onClick: () => { state.selectedTurnIds.clear(); render(); } }),
+        h("button", { class: "ml-chip", text: "Select all", onClick: () => { state.selectedTurnIds = new Set(state.exportTurns.map((t) => t.id)); render(); } }),
+        h("button", { class: "ml-chip", text: "Clear", onClick: () => { state.selectedTurnIds.clear(); render(); } }),
         h("span", { id: "ml-export-count", text: `${state.selectedTurnIds.size} selected` })
       ),
       list,
@@ -432,18 +608,25 @@
   }
 
   function openSettings() {
-    if (settingsModalOpen) return;
-    settingsModalOpen = true;
-    const backdrop = h("div", { class: "ml-modal-backdrop" });
-    const closeSettings = () => {
-      settingsModalOpen = false;
-      backdrop.remove();
-      render();
-    };
+    if (settingsViewOpen) return;
+    settingsViewOpen = true;
+    render();
+  }
+
+  function closeSettings() {
+    settingsViewOpen = false;
+    render();
+  }
+
+  function renderSettings() {
     const select = h("select", { class: "ml-select" });
-    Object.entries(S.PLAN_PROFILES).forEach(([key, profile]) => select.append(h("option", { value: key, text: profile.label })));
+    Object.entries(S.PLAN_PROFILES).forEach(([key, profile]) => {
+      if (profile.hidden) return;
+      select.append(h("option", { value: key, text: profile.label }));
+    });
     select.value = state.settings.quotaProfile;
 
+    const autoPlan = h("input", { type: "checkbox", checked: state.settings.autoUseDetectedPlan });
     const syncStatus = h("div", { class: "ml-sync-status", text: "Checking Google sync…" });
     const manualList = h("div", { class: "ml-manual-list" });
 
@@ -468,7 +651,7 @@
         manualList.append(h("div", { class: "ml-manual-row" },
           h("div", { class: "ml-manual-model" },
             h("b", { text: S.modelLabel(row.model) }),
-            h("small", { text: `current ${periodLabel(row.hours)} window` })
+            h("small", { text: `${periodLabel(row.hours)} window` })
           ),
           h("div", { class: "ml-stepper" }, minus, count, plus)
         ));
@@ -476,39 +659,57 @@
     };
     renderManualList();
 
-    const modal = h("div", { class: "ml-modal" },
-      h("div", { class: "ml-modal-title" }, h("strong", { text: "GPT Lens Settings" }), h("button", { class: "ml-icon-button", text: "×", onClick: closeSettings })),
-      h("label", { class: "ml-field" }, h("span", { text: "Quota profile" }), select),
-      h("label", { class: "ml-toggle-row" },
-        h("input", { type: "checkbox", checked: state.settings.autoUseDetectedPlan }),
-        h("span", { text: "自动使用 ChatGPT 检测到的套餐（x5/x20 仍需手动选择）" })
+    const view = h("div", { class: "ml-view ml-settings" },
+      h("section", { class: "ml-settings-section" },
+        h("div", { class: "ml-field-title", text: "Usage profile" }),
+        h("label", { class: "ml-field" }, h("span", { text: "Quota profile" }), select),
+        h("label", { class: "ml-toggle-row" },
+          autoPlan,
+          h("span", { text: "Use the detected ChatGPT plan automatically. Pro ×5 and Pro ×20 remain manual." })
+        )
       ),
-      h("div", { class: "ml-divider" }),
-      h("div", { class: "ml-field-title", text: "Manual usage correction" }),
-      h("div", { class: "ml-field-help", text: "Use + to add a local call. − offsets one recorded call in the same quota window. Corrections are stored locally and included in Google sync." }),
-      manualList,
-      h("div", { class: "ml-divider" }),
-      h("div", { class: "ml-field-title", text: "Google Drive sync" }),
-      syncStatus,
-      h("div", { class: "ml-button-row" },
-        h("button", { class: "ml-secondary", text: "Sign in", onClick: async () => { syncStatus.textContent = "Signing in…"; syncStatus.textContent = await googleAction("GOOGLE_SIGN_IN"); } }),
-        h("button", { class: "ml-secondary", text: "Sync now", onClick: async () => { syncStatus.textContent = "Syncing…"; syncStatus.textContent = await googleAction("GOOGLE_SYNC_NOW"); } }),
-        h("button", { class: "ml-secondary", text: "Sign out", onClick: async () => { syncStatus.textContent = await googleAction("GOOGLE_SIGN_OUT"); } })
+      h("section", { class: "ml-settings-section" },
+        h("div", { class: "ml-field-title", text: "Manual usage correction" }),
+        h("div", { class: "ml-field-help", text: "Adjust local counts without changing captured requests." }),
+        manualList
       ),
-      h("div", { class: "ml-divider" }),
-      h("button", { class: "ml-danger", text: "Clear local usage history", onClick: async () => {
-        if (!confirm("Clear GPT Lens local usage history?")) return;
-        state.events = [];
-        await saveEvents();
-        closeSettings();
-      } })
+      h("section", { class: "ml-settings-section" },
+        h("div", { class: "ml-field-title", text: "Google Drive sync" }),
+        syncStatus,
+        h("div", { class: "ml-button-row" },
+          h("button", { class: "ml-secondary", text: "Sign in", onClick: async () => {
+            syncStatus.textContent = "Signing in…";
+            syncStatus.textContent = await googleAction("GOOGLE_SIGN_IN");
+          } }),
+          h("button", { class: "ml-secondary", text: "Sync now", onClick: async () => {
+            syncStatus.textContent = "Syncing…";
+            syncStatus.textContent = await googleAction("GOOGLE_SYNC_NOW");
+          } }),
+          h("button", { class: "ml-secondary", text: "Sign out", onClick: async () => {
+            syncStatus.textContent = await googleAction("GOOGLE_SIGN_OUT");
+          } })
+        )
+      ),
+      h("section", { class: "ml-settings-section ml-settings-danger" },
+        h("button", { class: "ml-danger", text: "Clear local usage history", onClick: async () => {
+          if (!confirm("Clear GPT Lens local usage history?")) return;
+          state.events = [];
+          await saveEvents();
+          render();
+        } })
+      )
     );
-    backdrop.append(modal);
-    root.append(backdrop);
 
-    select.addEventListener("change", () => saveSettings({ quotaProfile: select.value, autoUseDetectedPlan] ? true : false }));
-    modal.querySelector(".ml-toggle-row input").addEventListener("change", (e) => saveSettings({ autoUseDetectedPlan] ? e.target.checked : false }));
+    select.addEventListener("change", async () => {
+      await saveSettings({ quotaProfile: select.value });
+      render();
+    });
+    autoPlan.addEventListener("change", async (event) => {
+      await saveSettings({ autoUseDetectedPlan: event.target.checked });
+      render();
+    });
     googleAction("GOOGLE_STATUS").then((text) => { syncStatus.textContent = text; });
+    return view;
   }
 
   async function googleAction(type) {
@@ -517,7 +718,7 @@
       if (!result?.ok) return result?.error || "Google sync unavailable";
       if (type === "GOOGLE_SYNC_NOW") {
         await loadState();
-        if (!settingsModalOpen) render();
+        if (!settingsViewOpen) render();
       }
       return result.message || (result.email ? `Connected: ${result.email}` : "Done");
     } catch (error) {
@@ -525,27 +726,91 @@
     }
   }
 
-  function render() {
-    root.className = state.settings.collapsed ? "is-collapsed" : "";
-    root.replaceChildren();
+  function renderEdgeHandle(mode) {
+    const latest = mostRecentEvent();
+    const status = statusInfo(latest?.status || "unverified");
+    const nextMode = mode === "dock" ? "peek" : "dock";
+    const actionLabel = mode === "dock" ? "Open GPT Lens" : "Hide summary";
+    const tooltip = `${status.label} · ${actionLabel}`;
+    return h("button", {
+      class: `ml-edge-handle ${status.cls}`,
+      "data-tooltip": tooltip,
+      "aria-label": tooltip,
+      onClick: () => saveSettings({ panelMode: nextMode })
+    },
+      h("span", { class: "ml-handle-chevron", text: mode === "dock" ? "‹" : "›" })
+    );
+  }
 
-    if (state.settings.collapsed) {
-      const latest = mostRecentEvent();
-      const status = statusInfo(latest?.status || "unverified");
-      root.append(h("button", {
-        class: `ml-rail ${status.cls}`,
-        title: "Open GPT Lens",
-        onClick: () => saveSettings({ collapsed: false }
-      }, h("span", { class: "ml-rail-dot" }), h("span", { class: "ml-rail-mark", text: "M" })));
-      return;
+  function renderPeek() {
+    const latest = mostRecentEvent();
+    const status = statusInfo(latest?.status || "unverified");
+    const quota = compactQuota(latest);
+    const model = latest?.frontendModel || "Waiting for request";
+    const numericQuota = quota?.kind === "numeric";
+    const usageText = !quota
+      ? "No quota data"
+      : numericQuota
+        ? `${quota.count} / ${quota.limitText}`
+        : quota.limitText;
+    const periodText = numericQuota ? formatCompactPeriod(quota.hours) : "";
+    const percentage = numericQuota ? Math.round(quota.ratio * 100) : null;
+
+    const card = h("button", {
+      class: "ml-peek-card",
+      title: "Open GPT Lens",
+      onClick: () => saveSettings({ panelMode: "full" })
+    },
+      h("div", { class: "ml-peek-top" },
+        h("strong", { class: "ml-peek-model", text: model, title: model })
+      ),
+      h("div", { class: "ml-peek-meta" },
+        h("span", { class: `ml-peek-count ${quota?.kind || "unknown"}` },
+          h("b", { text: usageText }),
+          periodText ? h("span", { class: "ml-peek-period", text: ` (${periodText})` }) : null,
+          quota?.uncertain ? h("span", { class: "ml-peek-uncertain", text: " ?" }) : null
+        ),
+        h("span", { class: `ml-peek-status ${status.cls}` },
+          h("i", { class: "ml-peek-status-dot" }),
+          h("span", { text: status.label })
+        )
+      ),
+      numericQuota ? h("div", { class: "ml-peek-progress-row" },
+        h("span", { class: "ml-peek-progress" },
+          h("i", { style: `--ml-progress:${quota.ratio * 100}%` })
+        ),
+        h("span", { class: "ml-peek-percent", text: `${percentage}%` })
+      ) : null
+    );
+
+    return h("div", { class: "ml-peek-wrap" }, card, renderEdgeHandle("peek"));
+  }
+
+  function renderFull() {
+    if (settingsViewOpen) {
+      return h("div", { class: "ml-shell" },
+        h("header", { class: "ml-header ml-settings-header" },
+          h("div", { class: "ml-settings-heading" },
+            h("button", { class: "ml-back-button", title: "Back", "aria-label": "Back", text: "‹", onClick: closeSettings }),
+            h("div", { class: "ml-brand" },
+              h("strong", { text: "Settings" }),
+              h("span", { class: "ml-brand-subtitle", text: "GPT Lens" })
+            )
+          )
+        ),
+        renderSettings()
+      );
     }
 
-    const shell = h("div", { class: "ml-shell" },
+    return h("div", { class: "ml-shell" },
       h("header", { class: "ml-header" },
-        h("div", { class: "ml-brand" }, h("span", { class: "ml-brand-mark", text: "M" }), h("strong", { text: "GPT Lens" })),
+        h("div", { class: "ml-brand" },
+          h("strong", { text: "GPT Lens" }),
+          h("span", { class: "ml-brand-subtitle", text: "Model & usage" })
+        ),
         h("div", { class: "ml-header-actions" },
           h("button", { class: "ml-icon-button", title: "Settings", text: "⋯", onClick: openSettings }),
-          h("button", { class: "ml-icon-button", title: "Collapse", text: "›", onClick: () => saveSettings({ collapsed: true }) })
+          h("button", { class: "ml-icon-button", title: "Back to summary", text: "›", onClick: () => saveSettings({ panelMode: "peek" }) })
         )
       ),
       h("nav", { class: "ml-segmented" },
@@ -554,14 +819,31 @@
       ),
       state.settings.view === "export" ? renderExport() : renderMonitor()
     );
-    root.append(shell);
+  }
+
+  function render() {
+    const mode = PANEL_MODES.has(state.settings.panelMode) ? state.settings.panelMode : "peek";
+    root.className = `is-${mode}`;
+    root.replaceChildren();
+
+    if (mode === "dock") {
+      root.append(renderEdgeHandle("dock"));
+      return;
+    }
+
+    if (mode === "peek") {
+      root.append(renderPeek());
+      return;
+    }
+
+    root.append(renderFull());
   }
 
   chrome.storage.onChanged.addListener(async (changes, area) => {
     if (area !== "local") return;
     if (changes.modelLensEvents || changes.modelLensSettings || changes.modelLensSyncMeta) {
       await loadState();
-      if (!settingsModalOpen) render();
+      if (!settingsViewOpen) render();
     }
   });
 
