@@ -428,7 +428,9 @@
       const period = kind === "numeric" ? formatPeriod(rule.period, rule.hours) : "";
       const valueText = kind === "numeric"
         ? `${count} / ${S.ruleLimitText(rule)}`
-        : S.ruleLimitText(rule);
+        : kind === "soft-unlimited"
+          ? `${count} · ${S.ruleLimitText(rule)}`
+          : S.ruleLimitText(rule);
       return h("div", { class: "ml-quota" },
         h("div", { class: "ml-quota-top" },
           h("span", { class: "ml-quota-name", text: rule.label }),
@@ -867,7 +869,9 @@
       ? "No quota data"
       : numericQuota
         ? `${quota.count} / ${quota.limitText}`
-        : quota.limitText;
+        : quota.kind === "soft-unlimited"
+          ? `${quota.count} · ${quota.limitText}`
+          : quota.limitText;
     const periodText = numericQuota ? formatCompactPeriod(quota.hours) : "";
     const percentage = numericQuota ? Math.round(quota.ratio * 100) : null;
 

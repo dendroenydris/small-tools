@@ -213,8 +213,10 @@
   }
 
   function countRule(events, rule, now = Date.now()) {
-    if (!rule || !rule.hours) return 0;
-    const cutoff = now - rule.hours * 3600_000;
+    if (!rule) return 0;
+    const allTime = rule.softUnlimited && !rule.hours;
+    if (!allTime && !rule.hours) return 0;
+    const cutoff = allTime ? -Infinity : now - rule.hours * 3600_000;
     const modelSet = new Set(rule.models.map(canonicalModel));
     const total = (events || []).reduce((sum, event) => {
       const ts = new Date(event.timestamp || 0).getTime();
