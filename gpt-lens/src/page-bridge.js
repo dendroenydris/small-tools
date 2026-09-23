@@ -38,28 +38,12 @@
     return String(method || "GET").toUpperCase();
   }
 
-  async function requestBody(input, init) {
+  // Only inspect bodies that are already available as immutable text.
+  // Never clone/read a Request or consume a ReadableStream: doing so can
+  // disturb ChatGPT's own request lifecycle.
+  function requestBodyText(init) {
     if (typeof init?.body === "string") return init.body;
-    if (input instanceof Request) {
-      try { return await input.clone().text(); }
-      catch { return null; }
-    }
     if (init?.body instanceof URLSearchParams) return init.body.toString();
-    if (typeof Blob !== "undefined" && init?.body instanceof Blob) {
-      try { return await init.body.text(); }
-      catch { return null; }
-    }
-    if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) {
-      try {
-        const body = init.body;
-        const bytes = body instanceof ArrayBuffer
-          ? new Uint8Array(body)
-          : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-        return new TextDecoder().decode(bytes);
-      } catch {
-        return null;
-      }
-    }
     return null;
   }
 
@@ -319,103 +303,99 @@
     }
   }
 
-  async function inspectFetch(downstream, receiver, input, init) {
-    const url = requestUrl(input);
-    const endpoint = R.classifyEndpoint(url);
-    const method = requestMethod(input, init);
+  function observeConversationResponse(responsePromise, captureId, startedAt, fields, pageUrl) {
+    return responsePromise.then((response) => {
+      const capture = pending.get(captureId);
+      const contentType = response?.headers?.get?.("content-type")?.split(";")[0]?.trim().toLowerCase() || "";
 
-    if (PLAN_RE.test(url) && method === "POST") {
-      void requestBody(input, init).then((raw) => {
-        const plan = parsePlanBody(raw);
+      if (!response?.ok) {
+        pending.delete(captureId);
+        return response;
+      }
+
+      if (contentType !== "text/event-stream") {
+        if (capture) {
+          capture.httpActive = false;
+          capture.expiresAt = Date.now() + PENDING_TTL_MS;
+        }
+        return response;
+      }
+
+      try {
+        const clone = response.clone();
+        queueMicrotask(() => {
+          parseSseStream(clone, captureId, startedAt, fields, pageUrl)
+            .catch(() => pending.delete(captureId));
+        });
+      } catch {
+        pending.delete(captureId);
+      }
+
+      return response;
+    }, (error) => {
+      pending.delete(captureId);
+      throw error;
+    });
+  }
+
+  function makeFetchWrapper(downstream) {
+    const wrapper = function fetch(input, init) {
+      // Start ChatGPT's real request first and with the exact original
+      // arguments. Non-target requests return this exact Promise unchanged.
+      const responsePromise = Reflect.apply(downstream, this, arguments);
+
+      const method = requestMethod(input, init);
+      if (method !== "POST") return responsePromise;
+
+      const url = requestUrl(input);
+
+      if (PLAN_RE.test(url)) {
+        const plan = parsePlanBody(requestBodyText(init));
         if (plan) {
           lastObservedPlan = plan;
           post("plan-observed", { plan });
         }
-      });
-    }
+      }
 
-    if (endpoint.kind !== "conversation_stream" || method !== "POST") {
-      return downstream.call(receiver, input, init);
-    }
+      const endpoint = R.classifyEndpoint(url);
+      if (endpoint.kind !== "conversation_stream") return responsePromise;
 
-    const captureId = crypto.randomUUID ? crypto.randomUUID() : `ml-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const startedAt = nowIso();
-    const pageUrl = location.href;
-    const bodyPromise = requestBody(input, init);
+      // If ChatGPT supplied a Request object/stream body, do not inspect it.
+      // Skipping one observation is safer than changing request semantics.
+      const raw = requestBodyText(init);
+      if (!raw) return responsePromise;
 
-    const requestFieldsPromise = bodyPromise.then((raw) => {
-      if (!raw) return null;
-      const parsed = R.parseConversationCapture(raw);
-      if (!parsed.fields.requestedModel) return null;
+      let parsed;
+      try { parsed = R.parseConversationCapture(raw); }
+      catch { return responsePromise; }
+      if (!parsed.fields.requestedModel) return responsePromise;
+
+      const captureId = crypto.randomUUID
+        ? crypto.randomUUID()
+        : `ml-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const startedAt = nowIso();
+      const pageUrl = location.href;
+
       registerPending(captureId, startedAt, parsed, pageUrl);
       emitObservation(captureId, parsed.fields, "requested", "page_fetch", startedAt, pageUrl);
-      return parsed.fields;
-    }).catch(() => null);
 
-    let response;
-    try {
-      response = await downstream.call(receiver, input, init);
-    } catch (error) {
-      pending.delete(captureId);
-      throw error;
-    }
-
-    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || "";
-    if (!response.ok || contentType !== "text/event-stream") return response;
-
-    try {
-      const clone = response.clone();
-      void requestFieldsPromise.then((fields) => {
-        if (!fields) {
-          try { clone.body?.cancel(); } catch {}
-          return;
-        }
-        return parseSseStream(clone, captureId, startedAt, fields, pageUrl);
-      }).catch(() => pending.delete(captureId));
-    } catch {
-      pending.delete(captureId);
-    }
-
-    return response;
-  }
-
-  let downstreamFetch = nativeFetch;
-  let fetchWrapper;
-
-  function makeFetchWrapper() {
-    const wrapper = function modelLensFetch(input, init) {
-      return inspectFetch(downstreamFetch, this, input, init);
+      return observeConversationResponse(
+        responsePromise,
+        captureId,
+        startedAt,
+        parsed.fields,
+        pageUrl
+      );
     };
     try {
       Object.defineProperty(wrapper, "name", { value: "fetch", configurable: true });
-      Object.defineProperty(wrapper, "length", { value: downstreamFetch.length, configurable: true });
+      Object.defineProperty(wrapper, "length", { value: downstream.length, configurable: true });
     } catch {}
     return wrapper;
   }
 
-  function installFetchHook() {
-    try {
-      const current = window.fetch;
-      if (typeof current === "function" && current !== fetchWrapper) downstreamFetch = current;
-    } catch {}
-    fetchWrapper = makeFetchWrapper();
-    try {
-      const descriptor = Object.getOwnPropertyDescriptor(window, "fetch");
-      Object.defineProperty(window, "fetch", {
-        configurable: true,
-        enumerable: descriptor?.enumerable ?? true,
-        get() { return fetchWrapper; },
-        set(candidate) {
-          if (typeof candidate === "function" && candidate !== fetchWrapper) {
-            downstreamFetch = candidate;
-            fetchWrapper = makeFetchWrapper();
-          }
-        }
-      });
-    } catch {
-      window.fetch = fetchWrapper;
-    }
-  }
+  const fetchWrapper = makeFetchWrapper(nativeFetch);
+  try { window.fetch = fetchWrapper; } catch {}
 
   const observedSockets = new WeakSet();
 
@@ -443,9 +423,6 @@
     });
   }
 
-  let downstreamWebSocket = nativeWebSocket;
-  let webSocketWrapper;
-
   function copyWebSocketShape(wrapper, downstream) {
     try { Object.setPrototypeOf(wrapper, Object.getPrototypeOf(downstream)); } catch {}
     for (const key of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
@@ -464,41 +441,22 @@
     } catch {}
   }
 
-  function makeWebSocketWrapper() {
+  function makeWebSocketWrapper(downstream) {
     const wrapper = function WebSocket(url, protocols) {
       if (!new.target) throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator.");
       const args = arguments.length > 1 ? [url, protocols] : [url];
-      const target = new.target === wrapper ? downstreamWebSocket : new.target;
-      const socket = Reflect.construct(downstreamWebSocket, args, target);
+      const target = new.target === wrapper ? downstream : new.target;
+      const socket = Reflect.construct(downstream, args, target);
       observeWebSocket(socket);
       return socket;
     };
-    copyWebSocketShape(wrapper, downstreamWebSocket);
+    copyWebSocketShape(wrapper, downstream);
     return wrapper;
   }
 
-  function installWebSocketHook() {
-    try {
-      const current = window.WebSocket;
-      if (typeof current === "function" && current !== webSocketWrapper) downstreamWebSocket = current;
-    } catch {}
-    webSocketWrapper = makeWebSocketWrapper();
-    try {
-      const descriptor = Object.getOwnPropertyDescriptor(window, "WebSocket");
-      Object.defineProperty(window, "WebSocket", {
-        configurable: true,
-        enumerable: descriptor?.enumerable ?? true,
-        get() { return webSocketWrapper; },
-        set(candidate) {
-          if (typeof candidate === "function" && candidate !== webSocketWrapper) {
-            downstreamWebSocket = candidate;
-            webSocketWrapper = makeWebSocketWrapper();
-          }
-        }
-      });
-    } catch {
-      window.WebSocket = webSocketWrapper;
-    }
+  if (nativeWebSocket) {
+    const webSocketWrapper = makeWebSocketWrapper(nativeWebSocket);
+    try { window.WebSocket = webSocketWrapper; } catch {}
   }
 
   window.addEventListener("message", (event) => {
@@ -506,25 +464,11 @@
     if (lastObservedPlan) post("plan-observed", { plan: lastObservedPlan });
   });
 
-  installFetchHook();
-  installWebSocketHook();
-  queueMicrotask(() => {
-    installFetchHook();
-    installWebSocketHook();
-  });
-  document.addEventListener("DOMContentLoaded", () => {
-    installFetchHook();
-    installWebSocketHook();
-  }, { once: true });
-  window.addEventListener("load", () => {
-    installFetchHook();
-    installWebSocketHook();
-  }, { once: true });
+  // Pruning is the only periodic work. Never reinstall or redefine page
+  // networking primitives after startup.
   window.setInterval(() => {
-    installFetchHook();
-    installWebSocketHook();
     prunePending();
-  }, 1000);
+  }, 30_000);
 
   post("bridge-ready", { timestamp: nowIso(), detector: "route-inspector-style-v1" });
 })();
